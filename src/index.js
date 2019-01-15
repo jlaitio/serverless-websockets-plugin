@@ -1,4 +1,4 @@
-const { is, map, all, filter, keys, isEmpty, flatten } = require('@serverless/utils')
+const { is, map, all, filter, keys, isEmpty, flatten, equals, get } = require('@serverless/utils')
 const chalk = require('chalk')
 
 class ServerlessWebsocketsPlugin {
@@ -7,7 +7,9 @@ class ServerlessWebsocketsPlugin {
     this.options = options
     this.provider = this.serverless.getProvider('aws')
 
-    this.functions = [] // to be filled later...
+    // to be filled later...
+    this.allFunctions = []
+    this.websocketFunctions = []
 
     this.hooks = {
       'after:deploy:deploy': this.deployWebsockets.bind(this), // todo change
@@ -53,7 +55,7 @@ class ServerlessWebsocketsPlugin {
     if (
       !is(Object, this.serverless.service.functions) ||
       keys(this.serverless.service.functions).length === 0 ||
-      isEmpty(this.functions)
+      isEmpty(this.websocketFunctions)
     ) {
       return
     }
@@ -74,23 +76,26 @@ class ServerlessWebsocketsPlugin {
     })
     const outputs = res.Stacks[0].Outputs
 
-    keys(this.serverless.service.functions || {}).map((name) => {
+    this.allFunctions = keys(this.serverless.service.functions || {}).map((name) => {
       const func = this.serverless.service.functions[name]
-      if (func.events && func.events.find((event) => event.websocket)) {
-        // find the arn of this function in the list of outputs...
-        const outputKey = this.provider.naming.getLambdaVersionOutputLogicalId(name)
-        const arn = outputs.find((output) => output.OutputKey === outputKey).OutputValue
 
-        // get list of route keys configured for this function
-        const routes = map((e) => e.websocket, filter((e) => e.websocket && e.websocket.routeKey, func.events))
+      // find the arn of this function in the list of outputs...
+      const outputKey = this.provider.naming.getLambdaVersionOutputLogicalId(name)
+      const arn = outputs.find((output) => output.OutputKey === outputKey).OutputValue
 
-        const fn = {
-          arn: arn,
-          routes
-        }
-        this.functions.push(fn)
+      // get list of routes configured for this function
+      const routes = map(
+        (e) => e.websocket,
+        filter((e) => e.websocket && e.websocket.routeKey, func.events || [])
+      )
+
+      return {
+        name,
+        arn,
+        routes
       }
     })
+    this.websocketFunctions = this.allFunctions.filter((fn) => !isEmpty(fn.routes))
   }
 
   async getApi() {
@@ -131,7 +136,7 @@ class ServerlessWebsocketsPlugin {
     return res.IntegrationId
   }
 
-  async addPermission(arn) {
+  async addPermission(arn, resource = '/*/*') {
     const functionName = arn.split(':')[6]
     const accountId = arn.split(':')[4]
     const region = arn.split(':')[3]
@@ -140,7 +145,7 @@ class ServerlessWebsocketsPlugin {
       Action: 'lambda:InvokeFunction',
       FunctionName: arn,
       Principal: 'apigateway.amazonaws.com',
-      SourceArn: `arn:aws:execute-api:${region}:${accountId}:${this.apiId}/*/*`,
+      SourceArn: `arn:aws:execute-api:${region}:${accountId}:${this.apiId}${resource}`,
       StatementId: `${functionName}-websocket`
     }
 
@@ -161,14 +166,65 @@ class ServerlessWebsocketsPlugin {
     return await this.provider.request('ApiGatewayV2', 'createRouteResponse', params)
   }
 
+  async createAuthorizer(arn, options) {
+    // check if matching authorizer exists already
+    const { Items } = await this.provider.request('ApiGatewayV2', 'getAuthorizers', {
+      ApiId: this.apiId
+    })
+
+    const AuthorizerUri = `arn:aws:apigateway:${
+      this.region
+    }:lambda:path/2015-03-31/functions/${arn}/invocations`
+
+    const existingAuthorizer = Items.find(
+      (item) =>
+        item.AuthorizerUri === AuthorizerUri && equals(item.IdentitySource, options.identitySources)
+    )
+
+    // if existing authorizer matches, return it
+    if (existingAuthorizer) {
+      return existingAuthorizer.AuthorizerId
+    }
+
+    // otherwise create a new one and return that
+    const params = {
+      ApiId: this.apiId,
+      AuthorizerUri,
+      AuthorizerType: 'REQUEST',
+      IdentitySource: options.identitySources,
+      Name: 'authorizer' + (Items.length + 1)
+    }
+
+    const { AuthorizerId } = await this.provider.request('ApiGatewayV2', 'createAuthorizer', params)
+
+    await this.addPermission(arn, `/authorizers/${AuthorizerId}`)
+
+    return AuthorizerId
+  }
+
   async createRoute(integrationId, route) {
+    const getAuthorizerId = async () => {
+      if (route.routeKey === '$connect' && route.authorizer) {
+        const authorizerArn =
+          route.authorizer.arn ||
+          get('arn', this.allFunctions.find((fn) => fn.name === route.authorizer.name))
+
+        if (authorizerArn && route.authorizer.identitySources) {
+          return await this.createAuthorizer(authorizerArn, route.authorizer)
+        }
+      }
+    }
+    const AuthorizerId = await getAuthorizerId()
+
     const params = {
       ApiId: this.apiId,
       RouteKey: route.routeKey,
-      Target: `integrations/${integrationId}`
+      Target: `integrations/${integrationId}`,
+      AuthorizerId,
+      AuthorizationType: AuthorizerId ? 'CUSTOM' : undefined
     }
     if (route.routeResponseSelectionExpression) {
-      params.RouteResponseSelectionExpression = route.routeResponseSelectionExpression;
+      params.RouteResponseSelectionExpression = route.routeResponseSelectionExpression
     }
 
     const res = await this.provider.request('ApiGatewayV2', 'createRoute', params).catch((e) => {
@@ -208,7 +264,7 @@ class ServerlessWebsocketsPlugin {
       await this.addPermission(fn.arn)
       const routesPromises = map((route) => this.createRoute(integrationId, route), fn.routes)
       return all(routesPromises)
-    }, this.functions)
+    }, this.websocketFunctions)
 
     return all(integrationsPromises)
   }
@@ -246,12 +302,12 @@ class ServerlessWebsocketsPlugin {
   async displayWebsockets() {
     this.init()
     await this.prepareFunctions()
-    if (isEmpty(this.functions)) {
+    if (isEmpty(this.websocketFunctions)) {
       return
     }
     await this.getApi()
     const baseUrl = this.getWebsocketUrl()
-    const routes = flatten(map((fn) => fn.routes.routeKey, this.functions))
+    const routes = flatten(map((fn) => fn.routes.routeKey, this.websocketFunctions))
     this.serverless.cli.consoleLog(chalk.yellow('WebSockets:'))
     this.serverless.cli.consoleLog(`  ${chalk.yellow('Base URL:')} ${baseUrl}`)
     this.serverless.cli.consoleLog(chalk.yellow('  Routes:'))

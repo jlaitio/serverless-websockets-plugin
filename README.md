@@ -52,3 +52,34 @@ functions:
           # See https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-websocket-api-route-response.html
           routeResponseSelectionExpression: $default
 ```
+
+### 2.1. Custom Authorizers
+You can configure a custom authorizer for your websocket API. Note that only the `$connect`-route uses the authorizer, and your subsequent frames will use the context from that authorization. Authorizer configurations for other routes will be ignored. You must supply the identity source(s) of your authentication, and either a function name or ARN. If your authorizer is not in the same service, you must use the ARN. Two examples:
+
+```yml
+functions:
+  authorizer:
+    handler: handler.authorization
+  connectionManagement:
+    handler: handler.connectionManagement
+    events:
+      - websocket:
+          routeKey: $connect
+          authorizer:
+            name: authorizer
+            identitySources:
+              - route.request.querystring.access_token
+```
+
+```yml
+functions:
+  connectionManagement:
+    handler: handler.connectionManagement
+    events:
+      - websocket:
+          routeKey: $connect
+          authorizer:
+            arn: arn:aws:myArn
+            identitySources:
+              - route.request.header.Authorization
+```
